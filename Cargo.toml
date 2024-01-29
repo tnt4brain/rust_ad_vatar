@@ -1,21 +1,16 @@
 [package]
 name = "rust_ad_vatar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies.ldap3]
-version = "0.9"
-
-[dependencies.rocket]
-version = "0.4.10"
-
-[dependencies.image]
-version = "0.24.1"
-
 [profile.dev]
 opt-level = 0
 
 [profile.release]
 opt-level = 3
+
+[dependencies]
+rocket = { version = "0.5.1", features = ["json"] }
+image = { version = "0.25.5" }
+ldap3 = { version = "0.11.5" }

@@ -1,20 +1,24 @@
-#![feature(proc_macro_hygiene, decl_macro)]
-
-use image::{GenericImageView};
-use ldap3::{LdapConn, Scope, SearchEntry};
-use rocket::http::{ContentType, MediaType};
-use rocket::{response::content, State};
+use image::imageops::FilterType;
+use image::{EncodableLayout, GenericImageView};
+use ldap3::{LdapConnAsync, Scope, SearchEntry};
+use rocket::http::ContentType;
+use rocket::http::Status;
+use rocket::Either::{Left, Right};
+use rocket::{Either, State};
+use std::env;
+use std::fs;
+use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[macro_use]
 extern crate rocket;
 extern crate core;
+extern crate image;
+extern crate ldap3;
 
 const ERR_CONNECTION: &str = "Connection error";
 const ERR_BIND: &str = "Binding as bind_dn error";
 const ERR_SEARCH: &str = "Object search error";
-const ERR_ENCODING: &str = "Image encoding error";
-const ERR_RETRIEVAL: &str = "LDAP image retrieval error";
 
 struct HitCount {
     count: AtomicUsize,
@@ -26,175 +30,190 @@ struct ServerConfig {
     bind_pw: String,
     base: String,
     attr: String,
+    file_static: Vec<u8>,
 }
 
-use image::imageops::FilterType;
-use std::io::Cursor;
-use std::env;
+fn return_default_image(filename: &str) -> Vec<u8> {
+    let f: &str = if filename.len() > 0 {
+        filename
+    } else {
+        "default.png"
+    };
+    fs::read(f).unwrap()
+}
 
 #[get("/")]
-fn index(hit_count: State<HitCount>) -> content::Html<String> {
+async fn index(hit_count: &State<HitCount>) -> &str {
     hit_count.count.fetch_add(1, Ordering::Relaxed);
-    return content::Html(format!("Visit count {}", count(hit_count)));
+    "OK"
 }
 
-#[get("/avatar/jpg/<email>?<size>")]
-fn avatar_jpg(email: String, size: u32, config: State<ServerConfig>) -> content::Content<Vec<u8>> {
-    let ldap_result = LdapConn::new(&config.ldap_uri);
-    let mut ldap_conn = match ldap_result {
-        Ok(ldap_conn) => ldap_conn,
+#[get("/metrics")]
+async fn vizit_count(hit_count: &State<HitCount>) -> (Status, (ContentType, String)) {
+    (
+        Status::Ok,
+        (
+            ContentType::Text,
+            format!(
+                "# TYPE http_server_requests_total counter
+# HELP http_server_requests_total The total number of HTTP requests handled by Rocket application
+http_server_requests_total {}",
+                hit_count.count.load(Ordering::Relaxed)
+            ),
+        ),
+    )
+}
+
+#[get("/default")]
+async fn default_image<'a>(
+    hit_count: &'a State<HitCount>,
+    config: &'a State<ServerConfig>,
+) -> (ContentType, &'a [u8]) {
+    hit_count.count.fetch_add(1, Ordering::Relaxed);
+    (ContentType::PNG, &config.file_static)
+}
+
+async fn read_ldap(
+    config: &State<ServerConfig>,
+    email: String,
+    size: u32,
+) -> Either<Box<[u8]>, String> {
+    let ldap_uri = config.ldap_uri.clone();
+    let tmp_conn = LdapConnAsync::new(&ldap_uri.to_owned()).await;
+    let mut ldap_handle = match tmp_conn {
+        Ok(tmp_conn) => {
+            ldap3::drive!(tmp_conn.0);
+            tmp_conn.1
+        }
         Err(e) => {
-            return content::Content(
-                ContentType(MediaType::HTML),
-                ERR_CONNECTION.as_bytes().to_vec(),
-            );
+            return Right(format!("{0}: {1}", ERR_CONNECTION, e.to_string()).to_string());
         }
     };
-    let bindresult = ldap_conn.simple_bind(&config.bind_dn, &config.bind_pw);
-    match bindresult {
-        Ok(_br) => (),
+    let _ = match ldap_handle
+        .simple_bind(&config.bind_dn, &config.bind_pw)
+        .await
+    {
+        Ok(_) => {}
         Err(e) => {
-            return content::Content(
-                ContentType(MediaType::HTML),
-                ERR_BIND.as_bytes().to_vec(),
-            );
+            return Right(format!("{0}: {1}", ERR_BIND, e.to_string()).to_string());
         }
-    }
-    let searchres = match ldap_conn.search(
-        &config.base,
-        Scope::Subtree,
-        format!("(&(objectClass=inetOrgPerson)(mail={}))", email).as_str(),
-        vec![&config.attr],
-    ) {
-        Ok(search) => search.success(),
-        Err(_e) => {
-            return content::Content(
-                ContentType(MediaType::HTML),
-                ERR_SEARCH.as_bytes().to_vec(),
-            );
-        } /* return format!("Search error: {:?}", e), */
     };
-    let (search_res, _err) = searchres.unwrap();
-    if let Some(entry) = search_res.into_iter().next() {
-        let z = SearchEntry::construct(entry);
-        let attr_res = z.bin_attrs.get(&config.attr);
-        match attr_res {
-            Some(res) => {
-                let arr: &[u8] = &res[0];
-                let img = image::load_from_memory(arr);
-                return match img {
+    let search_result = match ldap_handle
+        .search(
+            &config.base,
+            Scope::Subtree,
+            format!("(&(objectClass=inetOrgPerson)(mail={}))", email).as_str(),
+            vec![&config.attr],
+        )
+        .await
+    {
+        Ok(search) => search.success().unwrap(),
+        Err(e) => {
+            return Right(format!("{0}: {1}", ERR_SEARCH, e.to_string()).to_string());
+        }
+    };
+    if let Some(entry) = search_result.0.iter().next() {
+        match SearchEntry::construct(entry.clone())
+            .bin_attrs
+            .get(&config.attr)
+        {
+            Some(search_item) => {
+                let ldap_image = image::load_from_memory(&search_item[0]);
+                match ldap_image {
                     Ok(img) => {
                         let (width, height) = img.dimensions();
                         let ret_height = if width >= height { height } else { width };
                         let ret_width = if width < height { width } else { height };
-                        let target_size = match (size <= 32) || (size >= 512) {
+                        let target_size = match (size < 32) || (size > 512) {
                             false => size,
-                            true => 32,
+                            true => 64,
                         };
 
                         let cropped_img = img.crop_imm(0, 0, ret_width, ret_height).resize(
                             target_size,
                             target_size,
-                            FilterType::CatmullRom,
+                            FilterType::Lanczos3,
                         );
 
                         let mut img_output: Vec<u8> = Vec::new();
-                        let write_result = cropped_img.write_to(
-                            &mut Cursor::new(&mut img_output),
-                            image::ImageOutputFormat::Jpeg(100),
-                        );
-                        match write_result {
-                            Ok(image) => {
-                                content::Content(
-                                    ContentType(MediaType::JPEG),
-                                    img_output,
-                                )
-                            }
-                            Err(e) => {
-                                content::Content(
-                                    ContentType(MediaType::HTML),
-                                    ERR_ENCODING.as_bytes().to_vec(),
-                                )
-                            }
+                        match cropped_img
+                            .write_to(&mut Cursor::new(&mut img_output), image::ImageFormat::Jpeg)
+                        {
+                            Ok(_image) => Left(img_output.as_bytes().into()),
+                            Err(e) => Right(e.to_string()),
                         }
                     }
-                    Err(e) => {
-                        content::Content(
-                            ContentType(MediaType::HTML),
-                            ERR_RETRIEVAL.as_bytes().to_vec(),
-                        )
-                    }
-                };
+                    Err(e) => Right(e.to_string()),
+                }
             }
-            None => {
-                return_default_image()
-            }
+            None => Left(config.file_static.as_bytes().into()),
         }
     } else {
-        return_default_image()
+        Left(config.file_static.as_bytes().into())
     }
 }
 
-fn return_default_image() -> content::Content<Vec<u8>> {
-    let def_img = image::open("default.png");
-
-    // let img_output =  Vec::new();
-    // let write_result = def_img.write_to(
-    //     &mut Cursor::new(&img_output),
-    //     image::ImageOutputFormat::Jpeg(100),
-    // );
-
-    match def_img {
-        Ok(image) => {
-            content::Content(
-                ContentType(MediaType::PNG),
-                image.into_bytes()
+#[get("/avatar/<email>?<s>")]
+async fn avatar_jpg(
+    email: &str,
+    s: u32,
+    hit_count: &State<HitCount>,
+    config: &State<ServerConfig>,
+) -> (Status, (ContentType, Box<[u8]>)) {
+    hit_count.count.fetch_add(1, Ordering::Relaxed);
+    // let size =
+    //     match size_param.parse::<u32>() {
+    //         Ok(n) => n,
+    //         Err(e) => 128
+    //     };
+    let result_tuple = {
+        let ldap_result = read_ldap(config, email.to_string(), s).await;
+        if ldap_result.is_left() {
+            (Status::Ok, (ContentType::JPEG, ldap_result.left().unwrap()))
+        } else if ldap_result.is_right() {
+            (
+                Status::InternalServerError,
+                (
+                    ContentType::Text,
+                    ldap_result
+                        .right()
+                        .unwrap()
+                        .to_owned()
+                        .into_boxed_str()
+                        .into_boxed_bytes(),
+                ),
+            )
+        } else {
+            (
+                Status::InternalServerError,
+                (
+                    ContentType::Text,
+                    "Unexpected error"
+                        .to_owned()
+                        .into_boxed_str()
+                        .into_boxed_bytes(),
+                ),
             )
         }
-        Err(e) => {
-            content::Content(
-                ContentType(MediaType::HTML),
-                ERR_ENCODING.as_bytes().to_vec(),
-            )
-        }
-    }
-}
-
-#[get("/count")]
-fn count(hit_count: State<HitCount>) -> String {
-    hit_count.count.load(Ordering::Relaxed).to_string()
-}
-
-fn main() {
-    let config = ServerConfig {
-        ldap_uri: match env::var("RA_LDAP_URI") {
-            Ok(val) => val,
-            Err(e) => "ldap://127.0.0.1:389".to_string()
-        },
-        bind_dn: match env::var("RA_BIND_DN") {
-            Ok(val) => val,
-            Err(e) => "cn=frodo,dc=bantu,dc=ru".to_string()
-        },
-        bind_pw: match env::var("RA_BIND_PASSWORD") {
-            Ok(val) => val,
-            Err(e) => "secret".to_string()
-        },
-        base: match env::var("RA_SEARCH_BASE") {
-            Ok(val) => val,
-            Err(e) => "ou=Users,dc=bantu,dc=ru".to_string()
-        },
-        attr: match env::var("RA_IMAGE_ATTR") {
-            Ok(val) => val,
-            Err(e) => "jpegPhoto".to_string()
-        },
     };
+    result_tuple
+}
 
-    rocket::ignite()
+#[launch]
+fn rocket() -> _ {
+    let ldap_config = ServerConfig {
+        ldap_uri: env::var("RA_LDAP_URI").unwrap_or_else(|_e| "ldap://127.0.0.1:389".to_string()),
+        bind_dn: env::var("RA_BIND_DN")
+            .unwrap_or_else(|_e| "cn=bind_account,dc=acme,dc=com".to_string()),
+        bind_pw: env::var("RA_BIND_PASSWORD").unwrap_or_else(|_e| "$3cr3tp4$$w0rd".to_string()),
+        base: env::var("RA_SEARCH_BASE").unwrap_or_else(|_e| "ou=users,dc=acme,dc=com".to_string()),
+        attr: env::var("RA_IMAGE_ATTR").unwrap_or_else(|_e| "thumbnailPhoto".to_string()),
+        file_static: return_default_image(""),
+    };
+    rocket::build()
         .manage(HitCount {
             count: AtomicUsize::new(0),
-        }
-        )
-        .manage(config)
-        .mount("/", routes![index, avatar_jpg, count])
-        .launch();
+        })
+        .manage(ldap_config)
+        .mount("/", routes![index, vizit_count, default_image, avatar_jpg])
 }
